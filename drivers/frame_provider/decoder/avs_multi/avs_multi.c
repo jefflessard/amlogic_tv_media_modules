@@ -57,10 +57,8 @@
 
 #ifdef DEBUG_WITH_SINGLE_MODE
 #define DRIVER_NAME "amvdec_avs"
-#define MODULE_NAME "amvdec_avs"
 #else
 #define DRIVER_NAME "ammvdec_avs"
-#define MODULE_NAME "ammvdec_avs"
 #endif
 
 #define MULTI_DRIVER_NAME "ammvdec_avs"
@@ -554,6 +552,10 @@ struct vdec_avs_hw_s {
 	u32 decode_status_skip_pic_done_flag;
 	u32 decode_decode_cont_start_code;
 	int vdec_pg_enable_flag;
+	char vdec_name[32];
+	char pts_name[32];
+	char new_q_name[32];
+	char disp_q_name[32];
 };
 
 static void reset_process_time(struct vdec_avs_hw_s *hw);
@@ -774,22 +776,34 @@ static void set_frame_info(struct vdec_avs_hw_s *hw, struct vframe_s *vf,
 		/* always stretch to 16:9 */
 		vf->ratio_control |= (0x90 <<
 				DISP_RATIO_ASPECT_RATIO_BIT);
+		vf->sar_width = 1;
+		vf->sar_height = 1;
 	} else {
 		switch (pixel_ratio) {
 		case 1:
+			vf->sar_width = 1;
+			vf->sar_height = 1;
 			ar = (vf->height * hw->vavs_ratio) / vf->width;
 			break;
 		case 2:
+			vf->sar_width = 4;
+			vf->sar_height = 3;
 			ar = (vf->height * 3 * hw->vavs_ratio) / (vf->width * 4);
 			break;
 		case 3:
+			vf->sar_width = 16;
+			vf->sar_height = 9;
 			ar = (vf->height * 9 * hw->vavs_ratio) / (vf->width * 16);
 			break;
 		case 4:
+			vf->sar_width = 221;
+			vf->sar_height = 100;
 			ar = (vf->height * 100 * hw->vavs_ratio) / (vf->width *
 					221);
 			break;
 		default:
+			vf->sar_width = 1;
+			vf->sar_height = 1;
 			ar = (vf->height * hw->vavs_ratio) / vf->width;
 			break;
 		}
@@ -997,6 +1011,7 @@ static struct vframe_s *vavs_vf_get(void *op_arg)
 	struct vframe_s *vf;
 	struct vdec_avs_hw_s *hw =
 	(struct vdec_avs_hw_s *)op_arg;
+	unsigned long flags;
 
 	if (hw->recover_flag)
 		return NULL;
@@ -1006,6 +1021,7 @@ static struct vframe_s *vavs_vf_get(void *op_arg)
 	else if (step == 1)
 		step = 2;
 
+	spin_lock_irqsave(&lock, flags);
 	if (kfifo_get(&hw->display_q, &vf)) {
 		if (vf) {
 			hw->get_num++;
@@ -1027,9 +1043,10 @@ static struct vframe_s *vavs_vf_get(void *op_arg)
 				vf->type,
 				buf_of_vf(vf)->detached);
 		}
+		spin_unlock_irqrestore(&lock, flags);
 		return vf;
 	}
-
+	spin_unlock_irqrestore(&lock, flags);
 	return NULL;
 
 }
@@ -2738,8 +2755,12 @@ static void timeout_process(struct vdec_avs_hw_s *hw)
 	} else {
 		vavs_save_regs(hw);
 
-		if (hw->decode_pic_count == 0)
+		//if (hw->decode_pic_count == 0)
+		hw->decode_pic_count++;
+		if ((hw->decode_pic_count & 0xffff) == 0) {
+		/*make ucode do not handle it as first picture*/
 			hw->decode_pic_count++;
+		}
 	}
 	hw->dec_result = DEC_RESULT_DONE;
 
@@ -2912,8 +2933,12 @@ static void check_timer_func(unsigned long arg)
 			} else {
 				vavs_save_regs(hw);
 
-				if (hw->decode_pic_count == 0)
+				//if (hw->decode_pic_count == 0)
+				hw->decode_pic_count++;
+				if ((hw->decode_pic_count & 0xffff) == 0) {
+				/*make ucode do not handle it as first picture*/
 					hw->decode_pic_count++;
+				}
 			}
 			hw->dec_result = DEC_RESULT_DONE;
 
@@ -3276,7 +3301,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				READ_VREG(VLD_MEM_VIFIFO_RP),
 				READ_VREG(VIFF_BIT_CNT),
 				READ_VREG(VLD_MEM_VIFIFO_BYTES_AVAIL));
-	
+
 			if (((udebug_pause_pos & 0xffff)
 				== (debug_tag & 0xffff)) &&
 				(udebug_pause_decode_idx == 0 ||
@@ -3318,7 +3343,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				READ_VREG(DECODE_STATUS),
 				buffer_status_debug);
 		}
-	
+
 #ifdef AVSP_LONG_CABAC
 		if (firmware_sel == 0 && READ_VREG(LONG_CABAC_REQ)) {
 #ifdef PERFORMANCE_DEBUG
@@ -3329,7 +3354,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 			schedule_work(&long_cabac_wd_work);
 		}
 #endif
-	
+
 #ifdef ENABLE_USER_DATA
 		if (UserDataHandler(hw))
 			return IRQ_HANDLED;
@@ -3357,7 +3382,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 					}
 				}
 			}
-	
+
 			repeat_count = READ_VREG(AVS_REPEAT_COUNT);
 #ifdef USE_DYNAMIC_BUF_NUM
 			buffer_index =
@@ -3384,27 +3409,27 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 					hw->pts_i_hit++;
 			}
 #endif
-	
+
 			if ((dec_control & DEC_CONTROL_FLAG_FORCE_2500_1080P_INTERLACE)
 				&& hw->frame_width == 1920 && hw->frame_height == 1080) {
 				force_interlaced_frame = true;
 			}
-	
+
 			if (hw->throw_pb_flag && picture_type != I_PICTURE) {
-	
+
 				debug_print(hw, PRINT_FLAG_DECODING,
 					"%s WRITE_VREG(AVS_BUFFERIN, 0x%x) for throwing picture with type of %d\n",
 					__func__,
 					~(1 << buffer_index), picture_type);
-	
+
 				WRITE_VREG(AVS_BUFFERIN, ~(1 << buffer_index));
 			} else if (reg & INTERLACE_FLAG || force_interlaced_frame) {	/* interlace */
 				hw->throw_pb_flag = 0;
-	
+
 				debug_print(hw, PRINT_FLAG_VFRAME_DETAIL,
 					"interlace, picture type %d\n",
 						   picture_type);
-	
+
 				if (kfifo_get(&hw->newframe_q, &vf) == 0) {
 					pr_info
 					("fatal error, no available buffer slot.");
@@ -3468,17 +3493,17 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				if (hw->m_ins_flag) {
 					vf->canvas0Addr = vf->canvas1Addr = -1;
 					vf->plane_num = 2;
-	
+
 					vf->canvas0_config[0] = hw->canvas_config[buffer_index][0];
 					vf->canvas0_config[1] = hw->canvas_config[buffer_index][1];
-	
+
 					vf->canvas1_config[0] = hw->canvas_config[buffer_index][0];
 					vf->canvas1_config[1] = hw->canvas_config[buffer_index][1];
 				} else
 					vf->canvas0Addr = vf->canvas1Addr =
 						index2canvas(buffer_index);
 				vf->type_original = vf->type;
-	
+
 				debug_print(hw, PRINT_FLAG_VFRAME_DETAIL,
 					"buffer_index %d, canvas addr %x\n",
 						   buffer_index, vf->canvas0Addr);
@@ -3489,7 +3514,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 					decoder_bmmu_box_get_mem_handle(
 						hw->mm_blk_handle,
 						buffer_index);
-	
+
 				if (hw->m_ins_flag && vdec_frame_based(hw_to_vdec(hw)))
 					set_vframe_pts(hw, decode_pic_count, vf);
 
@@ -3502,12 +3527,12 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				debug_print(hw, PRINT_FLAG_PTS,
 					"interlace1 vf->pts = %d, vf->pts_us64 = %lld, pts_valid = %d\n", vf->pts, vf->pts_us64, pts_valid);
 				vdec_vframe_ready(vdec, vf);
-				kfifo_put(&hw->display_q,
-						  (const struct vframe_s *)vf);
+				kfifo_put(&hw->display_q, (const struct vframe_s *)vf);
+				ATRACE_COUNTER(hw->pts_name, vf->pts);
 				avs_vf_notify_receiver(hw, PROVIDER_NAME,
 						VFRAME_EVENT_PROVIDER_VFRAME_READY,
 						NULL);
-	
+
 				if (kfifo_get(&hw->newframe_q, &vf) == 0) {
 					pr_info("fatal error, no available buffer slot.");
 					return IRQ_HANDLED;
@@ -3557,10 +3582,10 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				if (hw->m_ins_flag) {
 					vf->canvas0Addr = vf->canvas1Addr = -1;
 					vf->plane_num = 2;
-	
+
 					vf->canvas0_config[0] = hw->canvas_config[buffer_index][0];
 					vf->canvas0_config[1] = hw->canvas_config[buffer_index][1];
-	
+
 					vf->canvas1_config[0] = hw->canvas_config[buffer_index][0];
 					vf->canvas1_config[1] = hw->canvas_config[buffer_index][1];
 				} else
@@ -3573,7 +3598,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 					decoder_bmmu_box_get_mem_handle(
 						hw->mm_blk_handle,
 						buffer_index);
-	
+
 				if (hw->m_ins_flag && vdec_frame_based(hw_to_vdec(hw)))
 					set_vframe_pts(hw, decode_pic_count, vf);
 
@@ -3584,15 +3609,15 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				debug_print(hw, PRINT_FLAG_PTS,
 					"interlace2 vf->pts = %d, vf->pts_us64 = %lld, pts_valid = %d\n", vf->pts, vf->pts_us64, pts_valid);
 				vdec_vframe_ready(vdec, vf);
-				kfifo_put(&hw->display_q,
-						  (const struct vframe_s *)vf);
+				kfifo_put(&hw->display_q, (const struct vframe_s *)vf);
+				ATRACE_COUNTER(hw->pts_name, vf->pts);
 				avs_vf_notify_receiver(hw, PROVIDER_NAME,
 						VFRAME_EVENT_PROVIDER_VFRAME_READY,
 						NULL);
 				hw->total_frame++;
 			} else {	/* progressive */
 				hw->throw_pb_flag = 0;
-	
+
 				debug_print(hw, PRINT_FLAG_VFRAME_DETAIL,
 					"progressive picture type %d\n",
 						   picture_type);
@@ -3604,7 +3629,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				set_frame_info(hw, vf, &dur);
 				vf->bufWidth = 1920;
 				hw->pic_type = 1;
-	
+
 				if ((picture_type == I_PICTURE) && pts_valid) {
 					vf->pts = pts;
 					if ((repeat_count > 1) && hw->avi_flag) {
@@ -3651,17 +3676,17 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				if (hw->m_ins_flag) {
 					vf->canvas0Addr = vf->canvas1Addr = -1;
 					vf->plane_num = 2;
-	
+
 					vf->canvas0_config[0] = hw->canvas_config[buffer_index][0];
 					vf->canvas0_config[1] = hw->canvas_config[buffer_index][1];
-	
+
 					vf->canvas1_config[0] = hw->canvas_config[buffer_index][0];
 					vf->canvas1_config[1] = hw->canvas_config[buffer_index][1];
 				} else
 					vf->canvas0Addr = vf->canvas1Addr =
 						index2canvas(buffer_index);
 				vf->type_original = vf->type;
-	
+
 				vf->pts = (pts_valid)?pts:0;
 				//vf->pts_us64 = (pts_valid) ? pts_us64 : 0;
 				debug_print(hw, PRINT_FLAG_VFRAME_DETAIL,
@@ -3674,7 +3699,7 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 					decoder_bmmu_box_get_mem_handle(
 						hw->mm_blk_handle,
 						buffer_index);
-	
+
 				if (hw->m_ins_flag && vdec_frame_based(hw_to_vdec(hw)))
 					set_vframe_pts(hw, decode_pic_count, vf);
 
@@ -3685,14 +3710,16 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				}
 				decoder_do_frame_check(hw_to_vdec(hw), vf);
 				vdec_vframe_ready(vdec, vf);
-				kfifo_put(&hw->display_q,
-						  (const struct vframe_s *)vf);
+				kfifo_put(&hw->display_q, (const struct vframe_s *)vf);
+				ATRACE_COUNTER(hw->pts_name, vf->pts);
+				ATRACE_COUNTER(hw->new_q_name, kfifo_len(&hw->newframe_q));
+				ATRACE_COUNTER(hw->disp_q_name, kfifo_len(&hw->display_q));
 				avs_vf_notify_receiver(hw, PROVIDER_NAME,
 						VFRAME_EVENT_PROVIDER_VFRAME_READY,
 						NULL);
 				hw->total_frame++;
 			}
-	
+
 			/*count info*/
 			vdec_count_info(hw->gvs, 0, offset);
 			if (offset) {
@@ -3713,8 +3740,8 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 			WRITE_VREG(AVS_BUFFEROUT, 0);
 		}
 		//WRITE_VREG(ASSIST_MBOX1_CLR_REG, 1);
-	
-	
+
+
 		if (hw->m_ins_flag) {
 			u32 status_reg = READ_VREG(DECODE_STATUS);
 			u32 decode_status = status_reg & 0xff;
@@ -3770,13 +3797,17 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 #endif
 				if (vdec_frame_based(hw_to_vdec(hw))) {
 					hw->dec_result = DEC_RESULT_DONE;
-					if (hw->decode_pic_count == 0) {
+					//if (hw->decode_pic_count == 0) {
+						hw->decode_pic_count++;
+					//}
+					if ((hw->decode_pic_count & 0xffff) == 0) {
+					/*make ucode do not handle it as first picture*/
 						hw->decode_pic_count++;
 					}
 					vavs_save_regs(hw);
 				} else
 					hw->dec_result = DEC_RESULT_AGAIN;
-	
+
 				debug_print(hw, PRINT_FLAG_DECODING,
 					"%s BUF_EMPTY, READ_VREG(DECODE_STATUS) = 0x%x, decode_status 0x%x, buf_status 0x%x, scratch_8 (AVS_BUFFERIN) 0x%x, dec_result = 0x%x, decode_pic_count = %d, bit_cnt=0x%x, hw->decode_status_skip_pic_done_flag = %d, hw->decode_decode_cont_start_code = 0x%x\n",
 					__func__, status_reg, decode_status,
@@ -3788,8 +3819,8 @@ static irqreturn_t vmavs_isr_thread_fn(struct vdec_s *vdec, int irq)
 				return IRQ_HANDLED;
 			}
 		}
-	
-	
+
+
 #ifdef HANDLE_AVS_IRQ
 		return IRQ_HANDLED;
 #else
@@ -4000,6 +4031,15 @@ static void vmavs_dump_state(struct vdec_s *vdec)
 	pdata->irq_handler = vmavs_isr;
 	pdata->threaded_irq_handler = vmavs_isr_thread_fn;
 	pdata->dump_state = vmavs_dump_state;
+
+	snprintf(hw->vdec_name, sizeof(hw->vdec_name),
+		"avs-%d", pdev->id);
+	snprintf(hw->pts_name, sizeof(hw->pts_name),
+		"%s-pts", hw->vdec_name);
+	snprintf(hw->new_q_name, sizeof(hw->new_q_name),
+		"%s-newframe_q", hw->vdec_name);
+	snprintf(hw->disp_q_name, sizeof(hw->disp_q_name),
+		"%s-dispframe_q", hw->vdec_name);
 
 	vavs_vdec_info_init(hw);
 

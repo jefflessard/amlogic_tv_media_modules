@@ -184,8 +184,6 @@ static unsigned int amstream_sub_poll
 (struct file *file, poll_table *wait_table);
 static unsigned int amstream_userdata_poll
 (struct file *file, poll_table *wait_table);
-static ssize_t amstream_userdata_read
-(struct file *file, char *buf, size_t count, loff_t *ppos);
 static int (*amstream_adec_status)
 (struct adec_status *astatus);
 #ifdef CONFIG_AM_VDEC_REAL
@@ -295,7 +293,6 @@ static const struct file_operations userdata_fops = {
 	.owner = THIS_MODULE,
 	.open = amstream_open,
 	.release = amstream_release,
-	.read = amstream_userdata_read,
 	.poll = amstream_userdata_poll,
 	.unlocked_ioctl = amstream_ioctl,
 #ifdef CONFIG_COMPAT
@@ -330,7 +327,20 @@ static wait_queue_head_t amstream_userdata_wait;
 static struct userdata_poc_info_t userdata_poc_info[USERDATA_FIFO_NUM];
 static int userdata_poc_ri, userdata_poc_wi;
 static int last_read_wi;
-static u32 ud_ready_vdec_flag;
+
+#define MAX_USERDATA_CHANNEL_NUM 9
+
+typedef struct {
+	struct mutex mutex;
+	wait_queue_head_t userdata_wait;
+	u32 video_id;
+	u32 set_id_flag;
+	u32 ready_flag[MAX_USERDATA_CHANNEL_NUM];
+	int used[MAX_USERDATA_CHANNEL_NUM];
+	u32 id[MAX_USERDATA_CHANNEL_NUM];
+} st_userdata;
+
+st_userdata  userdata;
 
 /*bit 1 force dual layer
  *bit 2 force frame mode
@@ -776,17 +786,14 @@ static int audio_port_reset(struct stream_port_s *port,
 				struct stream_buf_s *pbuf)
 {
 	int r;
-	mutex_lock(&amstream_mutex);
 	if ((port->flag & PORT_FLAG_AFORMAT) == 0) {
 		pr_err("aformat not set\n");
-		mutex_unlock(&amstream_mutex);
 		return 0;
 	}
 
 	pr_info("audio port reset, flag:0x%x\n", port->flag);
 	if ((port->flag & PORT_FLAG_INITED) == 0) {
 		pr_info("audio port not inited,return\n");
-		mutex_unlock(&amstream_mutex);
 		return 0;
 	}
 
@@ -797,14 +804,12 @@ static int audio_port_reset(struct stream_port_s *port,
 
 	r = stbuf_init(pbuf, NULL);
 	if (r < 0) {
-		mutex_unlock(&amstream_mutex);
 		return r;
 	}
 
 	r = adec_init(port);
 	if (r < 0) {
 		audio_port_release(port, pbuf, 2);
-		mutex_unlock(&amstream_mutex);
 		return r;
 	}
 
@@ -831,7 +836,6 @@ static int audio_port_reset(struct stream_port_s *port,
 	//tsync_audio_break(0);
 
 	pr_info("audio_port_reset done\n");
-	mutex_unlock(&amstream_mutex);
 	return r;
 }
 
@@ -1506,153 +1510,96 @@ EXPORT_SYMBOL(wakeup_userdata_poll);
 
 void amstream_wakeup_userdata_poll(struct vdec_s *vdec)
 {
-	int vdec_id;
+	int i;
 
-	vdec_id = vdec->id;
-	if (vdec_id > 31) {
-		pr_info("Error, not support so many instances(%d) user data push\n",
-			vdec_id);
+	if (vdec == NULL) {
+		pr_info("Error, invalid vdec instance!\n");
 		return;
 	}
 
-	mutex_lock(&userdata_mutex);
-	ud_ready_vdec_flag |= (1<<vdec_id);
+	mutex_lock(&userdata.mutex);
 
-	atomic_set(&userdata_ready, 1);
-	mutex_unlock(&userdata_mutex);
+	for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
+		if (userdata.set_id_flag && (userdata.id[i] == vdec->video_id)) {
+			userdata.ready_flag[i] = 1;
+			break;
+		} else if (!userdata.set_id_flag) {
+			if (!userdata.used[0]) {
+				vdec->video_id = vdec->id;
+				userdata.id[0] = vdec->id;
+				userdata.used[0] = 1;
+			}
 
-	wake_up_interruptible(&amstream_userdata_wait);
+			userdata.ready_flag[i] = 1;
+			break;
+		}
+	}
+
+	mutex_unlock(&userdata.mutex);
+
+	wake_up_interruptible(&userdata.userdata_wait);
 }
 EXPORT_SYMBOL(amstream_wakeup_userdata_poll);
 
 static unsigned int amstream_userdata_poll(struct file *file,
 		poll_table *wait_table)
 {
-	poll_wait(file, &amstream_userdata_wait, wait_table);
-	if (atomic_read(&userdata_ready)) {
-		atomic_set(&userdata_ready, 0);
+	int fd_match = 0;
+	int i;
+
+	poll_wait(file, &userdata.userdata_wait, wait_table);
+	mutex_lock(&userdata.mutex);
+	for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
+		if (userdata.id[i] == userdata.video_id && userdata.ready_flag[i] == 1) {
+			fd_match = 1;
+			break;
+		}
+	}
+
+	if (fd_match) {
+		mutex_unlock(&userdata.mutex);
 		return POLLIN | POLLRDNORM;
 	}
+
+	mutex_unlock(&userdata.mutex);
 	return 0;
 }
 
-static ssize_t amstream_userdata_read(struct file *file, char __user *buf,
-			size_t count, loff_t *ppos)
+static void amstream_userdata_init(void)
 {
-	u32 data_size, res, retVal = 0;
-	u32 buf_wp, buf_rp, buf_size;
-	unsigned long buf_start;
-	struct stream_buf_s *userdata_buf = &bufs[BUF_TYPE_USERDATA];
-#ifdef DEBUG_USER_DATA
-	int old_wi;
-#endif
+	int i;
 
-	mutex_lock(&userdata_mutex);
+	init_waitqueue_head(&userdata.userdata_wait);
+	mutex_init(&userdata.mutex);
+	userdata.set_id_flag = 0;
 
-	if (userdata_poc_ri != last_read_wi) {
-		/***********************************************
-		app picks up poc counter wrong from last read user data
-		for H264. So, we need to recalculate userdata_poc_ri
-		to the userdata_poc_wi from the last read.
-		***********************************************/
-#if 0
-		pr_info("app pick up poc error: ri = %d, last_wi = %d\n",
-			userdata_poc_ri, last_read_wi);
-#endif
-		userdata_poc_ri = last_read_wi;
+	for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
+		userdata.ready_flag[i] = 0;
+		userdata.id[i] = -1;
+		userdata.used[i] = 0;
 	}
 
-	buf_wp = userdata_buf->buf_wp;
-	buf_rp = userdata_buf->buf_rp;
-	buf_size = userdata_buf->buf_size;
-	buf_start = userdata_buf->buf_start;
-#ifdef DEBUG_USER_DATA
-	old_wi = last_read_wi;
-#endif
-	last_read_wi = userdata_poc_wi;
-	mutex_unlock(&userdata_mutex);
+	return;
+}
 
-	if (buf_start == 0 || buf_size == 0)
-		return 0;
-	if (buf_wp == buf_rp)
-		return 0;
-	if (buf_wp > buf_rp)
-		data_size = buf_wp - buf_rp;
-	else
-		data_size = buf_size - buf_rp + buf_wp;
+static void amstream_userdata_deinit(void)
+{
+	int i;
 
-	if (data_size > count)
-		data_size = count;
-#ifdef DEBUG_USER_DATA
-	pr_info("wi:%d ri:%d wp:%d rp:%d size:%d, last_read_wi=%d\n",
-		userdata_poc_wi, userdata_poc_ri,
-		buf_wp, buf_rp, data_size, old_wi);
-#endif
-	if (buf_wp < buf_rp) {
-		int first_num = buf_size - buf_rp;
-		if (data_size <= first_num) {
-			res = copy_to_user((void *)buf,
-				(void *)((buf_rp +
-				buf_start)), data_size);
-			if (res)
-				pr_info("p1 read not end res=%d, request=%d\n",
-					res, data_size);
+	mutex_lock(&userdata.mutex);
 
-			mutex_lock(&userdata_mutex);
-			userdata_buf->buf_rp += data_size - res;
-			mutex_unlock(&userdata_mutex);
-			retVal = data_size - res;
-		} else {
-			if (first_num > 0) {
-				res = copy_to_user((void *)buf,
-				(void *)((buf_rp +
-				buf_start)), first_num);
-				if (res)
-					pr_info("p2 read not end res=%d, request=%d\n",
-						res, first_num);
-
-				res = copy_to_user((void *)buf+first_num,
-				(void *)(buf_start),
-				data_size - first_num);
-
-				if (res)
-					pr_info("p3 read not end res=%d, request=%d\n",
-						res, data_size - first_num);
-
-				mutex_lock(&userdata_mutex);
-				userdata_buf->buf_rp += data_size;
-				if (userdata_buf->buf_rp >= buf_size)
-					userdata_buf->buf_rp =
-						userdata_buf->buf_rp - buf_size;
-				mutex_unlock(&userdata_mutex);
-
-				retVal = data_size;
-			} else {
-				/* first_num == 0*/
-				res = copy_to_user((void *)buf,
-				(void *)((buf_start)),
-				data_size - first_num);
-				mutex_lock(&userdata_mutex);
-				userdata_buf->buf_rp =
-					data_size - first_num - res;
-				mutex_unlock(&userdata_mutex);
-				retVal = data_size - first_num - res;
-			}
+	userdata.set_id_flag = 0;
+	for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
+		if (userdata.used[i] == 1) {
+			userdata.ready_flag[i] = 0;
+			userdata.id[i] = -1;
+			userdata.used[i] = 0;
 		}
-	} else {
-		res = copy_to_user((void *)buf,
-			(void *)((buf_rp + buf_start)),
-			data_size);
-		if (res)
-			pr_info("p4 read not end res=%d, request=%d\n",
-				res, data_size);
-
-		mutex_lock(&userdata_mutex);
-		userdata_buf->buf_rp += data_size - res;
-		mutex_unlock(&userdata_mutex);
-		retVal = data_size - res;
 	}
-	return retVal;
+
+	mutex_unlock(&userdata.mutex);
+
+	return;
 }
 
 #ifdef VDEC_FCC_SUPPORT
@@ -2030,6 +1977,8 @@ static int amstream_release(struct inode *inode, struct file *file)
 		amports_switch_gate("demux", 0);
 	}
 
+	amstream_userdata_deinit();
+
 	mutex_destroy(&priv->mutex);
 
 	kfree(priv);
@@ -2231,6 +2180,7 @@ static long amstream_ioctl_set(struct port_priv_s *priv, ulong arg)
 	struct  stream_port_s *this = priv->port;
 	struct am_ioctl_parm parm;
 	long r = 0;
+	int i;
 
 	if (copy_from_user
 		((void *)&parm, (void *)arg,
@@ -2413,7 +2363,9 @@ static long amstream_ioctl_set(struct port_priv_s *priv, ulong arg)
 		if (this->type & PORT_TYPE_AUDIO) {
 			struct stream_buf_s *pabuf = &bufs[BUF_TYPE_AUDIO];
 
+			mutex_lock(&amstream_mutex);
 			r = audio_port_reset(this, pabuf);
+			mutex_unlock(&amstream_mutex);
 		} else
 			r = -EINVAL;
 
@@ -2536,6 +2488,26 @@ static long amstream_ioctl_set(struct port_priv_s *priv, ulong arg)
 	case AMSTREAM_SET_NO_POWERDOWN:
 		vdec_set_no_powerdown(parm.data_32);
 		break;
+	case AMSTREAM_SET_VIDEO_ID:
+		priv->vdec->video_id = parm.data_32;
+		mutex_lock(&userdata.mutex);
+		for (i = 0;i < MAX_USERDATA_CHANNEL_NUM; i++) {
+			if (userdata.used[i] == 0) {
+				userdata.id[i] = priv->vdec->video_id;
+				userdata.used[i] = 1;
+				userdata.video_id = priv->vdec->video_id;
+				userdata.set_id_flag = 1;
+				break;
+			}
+		}
+		mutex_unlock(&userdata.mutex);
+
+		pr_info("AMSTREAM_SET_VIDEO_ID video_id: %d\n", parm.data_32);
+		break;
+	case AMSTREAM_SET_DMC_URGENT:
+		vdec_set_dmc_urgent(priv->vdec, parm.data_32);
+		break;
+
 	default:
 		r = -ENOIOCTLCMD;
 		break;
@@ -2587,7 +2559,7 @@ static long amstream_ioctl_get_ex(struct port_priv_s *priv, ulong arg)
 			struct am_ioctl_parm_ex *p = &parm;
 			struct stream_buf_s *buf = NULL;
 
-			mutex_unlock(&amstream_mutex);
+			mutex_lock(&amstream_mutex);
 
 			/*
 			 *todo: check upper layer for decoder
@@ -2703,6 +2675,22 @@ static long amstream_ioctl_get_ex(struct port_priv_s *priv, ulong arg)
 				userdata_poc_ri = 0;
 		} else
 			r = -EINVAL;
+		break;
+	case AMSTREAM_GET_EX_WR_COUNT:
+	{
+		struct am_ioctl_parm_ex *p = &parm;
+		struct vdec_s *vdec = priv->vdec;
+
+		mutex_lock(&amstream_mutex);
+		if (!vdec)
+			vdec = vdec_get_vdec_by_id(0); //Use id 0 as default
+		if (vdec && vdec->mvfrm)
+			p->wr_count = vdec->mvfrm->wr;
+		else
+			p->wr_count = 0;
+		mutex_unlock(&amstream_mutex);
+		r = 0;
+	}
 		break;
 	default:
 		r = -ENOIOCTLCMD;
@@ -2874,21 +2862,35 @@ static long amstream_do_ioctl_new(struct port_priv_s *priv,
 			u32 slots = 0;
 			u32 struct_size = 0;
 			int vdec_id = 0;
-			struct vdec_s *vdec = NULL;
+			struct vdec_s *vdec = priv->vdec;
 			struct vframe_counter_s *tmpbuf = kmalloc(QOS_FRAME_NUM *
 						sizeof(struct vframe_counter_s),GFP_KERNEL);
 			struct av_param_mvdec_t  __user *uarg = (void *)arg;
 
+			mutex_lock(&amstream_mutex);
 			if (!tmpbuf) {
 				r = -EFAULT;
 				pr_err("kmalloc vframe_counter_s failed!\n");
+				mutex_unlock(&amstream_mutex);
 				break;
 			}
 
-			vdec = vdec_get_vdec_by_id(vdec_id);
+			if (get_user(vdec_id, &uarg->vdec_id) < 0 ||
+				get_user(struct_size, &uarg->struct_size) < 0) {
+				r = -EFAULT;
+				kfree(tmpbuf);
+				mutex_unlock(&amstream_mutex);
+				break;
+			}
+
+			if (vdec && !vdec_id) //If vdec_id is > 0, it means user require to use it.
+				r = 0;//vdec =priv->vdec;//Nothing to do.
+			else
+				vdec = vdec_get_vdec_by_id(vdec_id);
 			if (!vdec) {
 				r = 0;
 				kfree(tmpbuf);
+				mutex_unlock(&amstream_mutex);
 				break;
 			}
 
@@ -2897,17 +2899,12 @@ static long amstream_do_ioctl_new(struct port_priv_s *priv,
 				put_user(slots, &uarg->slots);
 			if (slots) {
 				if (AMSTREAM_IOC_GET_MVDECINFO == cmd) {
-					if (get_user(vdec_id, &uarg->vdec_id) < 0 ||
-					get_user(struct_size, &uarg->struct_size) < 0) {
-						r = -EFAULT;
-						kfree(tmpbuf);
-						break;
-					}
-					if (copy_to_user((void *)&uarg->comm,
+					if (vdec->mvfrm && copy_to_user((void *)&uarg->comm,
 								&vdec->mvfrm->comm,
 								sizeof(struct vframe_comm_s))) {
 						r = -EFAULT;
 						kfree(tmpbuf);
+						mutex_unlock(&amstream_mutex);
 						break;
 					}
 					if (struct_size == sizeof(struct av_param_mvdec_t_old)) {//old struct
@@ -2918,11 +2915,13 @@ static long amstream_do_ioctl_new(struct port_priv_s *priv,
 										&tmpbuf[m],
 										sizeof(struct vframe_counter_s_old))) {
 								r = -EFAULT;
+								mutex_unlock(&amstream_mutex);
 								break;
 							}
 						}
 						if (r < 0) {
 							kfree(tmpbuf);
+							mutex_unlock(&amstream_mutex);
 							break;
 						}
 					} else if (struct_size == sizeof(struct av_param_mvdec_t)) {//new struct
@@ -2931,6 +2930,7 @@ static long amstream_do_ioctl_new(struct port_priv_s *priv,
 									slots*sizeof(struct vframe_counter_s))) {
 							r = -EFAULT;
 							kfree(tmpbuf);
+							mutex_unlock(&amstream_mutex);
 							break;
 						}
 					} else {
@@ -2946,11 +2946,13 @@ static long amstream_do_ioctl_new(struct port_priv_s *priv,
 									&tmpbuf[i].qos,
 									sizeof(struct vframe_qos_s))) {
 							r = -EFAULT;
+							mutex_unlock(&amstream_mutex);
 							break;
 						}
 					}
 					if (r < 0) {
 						kfree(tmpbuf);
+						mutex_unlock(&amstream_mutex);
 						break;
 					}
 				}
@@ -2961,6 +2963,7 @@ static long amstream_do_ioctl_new(struct port_priv_s *priv,
 			}
 			kfree(tmpbuf);
 		}
+		mutex_unlock(&amstream_mutex);
 		break;
 	case AMSTREAM_IOC_GET_AVINFO:
 		{
@@ -3003,6 +3006,7 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 {
 	struct stream_port_s *this = priv->port;
 	long r = 0;
+	int i;
 
 	switch (cmd) {
 
@@ -3361,7 +3365,9 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 		if (this->type & PORT_TYPE_AUDIO) {
 			struct stream_buf_s *pabuf = &bufs[BUF_TYPE_AUDIO];
 
+			mutex_lock(&amstream_mutex);
 			r = audio_port_reset(this, pabuf);
+			mutex_unlock(&amstream_mutex);
 		} else
 			r = -EINVAL;
 
@@ -3466,7 +3472,7 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 					break;
 				}
 				mutex_lock(&amstream_mutex);
-				vdec = vdec_get_vdec_by_id(p_userdata_param->instance_id);
+				vdec = vdec_get_vdec_by_video_id(p_userdata_param->instance_id);
 				if (vdec) {
 					if (vdec_read_user_data(vdec,
 							p_userdata_param) == 0) {
@@ -3488,12 +3494,22 @@ static long amstream_do_ioctl_old(struct port_priv_s *priv,
 
 	case AMSTREAM_IOC_UD_AVAILABLE_VDEC:
 		{
-			unsigned int ready_vdec;
+			unsigned int ready_vdec = 0;
+			u32 ready_flag = 0;
 
-			mutex_lock(&userdata_mutex);
-			ready_vdec = ud_ready_vdec_flag;
-			ud_ready_vdec_flag = 0;
-			mutex_unlock(&userdata_mutex);
+			mutex_lock(&userdata.mutex);
+			for (i = 0; i < MAX_USERDATA_CHANNEL_NUM; i++) {
+				if (userdata.video_id == userdata.id[i] &&
+					userdata.ready_flag[i] == 1) {
+					ready_vdec = userdata.id[i];
+					userdata.ready_flag[i] = 0;
+					ready_flag = 1;
+					break;
+				}
+			}
+			if (!ready_flag)
+				r = -EINVAL;
+			mutex_unlock(&userdata.mutex);
 
 			put_user(ready_vdec, (uint32_t __user *)arg);
 		}
@@ -4438,6 +4454,7 @@ static ssize_t audio_path_store(struct class *class,
 		return -EINVAL;
 	if (val != 1)
 		return -EINVAL;
+	mutex_lock(&amstream_mutex);
 	for (i = 0; i < MAX_AMSTREAM_PORT_NUM; i++) {
 		if (strcmp(ports[i].name, "amstream_mpts") == 0 ||
 			strcmp(ports[i].name, "amstream_mpts_sched") == 0) {
@@ -4448,6 +4465,7 @@ static ssize_t audio_path_store(struct class *class,
 			}
 		}
 	}
+	mutex_unlock(&amstream_mutex);
 	return size;
 }
 
@@ -4723,6 +4741,8 @@ static int amstream_probe(struct platform_device *pdev)
 	if (fcc_enable & 0x1)
 		amstream_fcc_init();
 #endif
+
+	amstream_userdata_init();
 	/* poweroff the decode core because dos can not be reset when reboot */
 	if (get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_G12A)
 		vdec_power_reset();

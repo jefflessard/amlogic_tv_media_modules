@@ -115,6 +115,7 @@ static u32 vh264mvc_ratio;
 static u32 h264mvc_ar;
 static u32 no_dropping_cnt;
 static s32 init_drop_cnt;
+spinlock_t mvc_rp_lock;
 
 #ifdef DEBUG_SKIP
 static unsigned long view_total, view_dropped;
@@ -333,14 +334,103 @@ static void set_frame_info(struct vframe_s *vf)
 		/* always stretch to 16:9 */
 		vf->ratio_control |= (0x90 <<
 				DISP_RATIO_ASPECT_RATIO_BIT);
+		vf->sar_height = 1;
+		vf->sar_width = 1;
 	} else {
 		/* h264mvc_ar = ((float)frame_height/frame_width)
 		 *customer_ratio;
 		 */
-		ar =  min_t(u32, h264mvc_ar, DISP_RATIO_ASPECT_RATIO_MAX);
-
-		vf->ratio_control = (ar << DISP_RATIO_ASPECT_RATIO_BIT);
+		switch (h264mvc_ar) {
+		case 1:
+			ar = 0x3ff;
+			vf->sar_height = 1;
+			vf->sar_width = 1;
+			break;
+		case 2:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 12;
+			break;
+		case 3:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 10;
+			break;
+		case 4:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 16;
+			break;
+		case 5:
+			ar = 0x3ff;
+			vf->sar_height = 33;
+			vf->sar_width = 40;
+			break;
+		case 6:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 24;
+			break;
+		case 7:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 20;
+			break;
+		case 8:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 32;
+			break;
+		case 9:
+			ar = 0x3ff;
+			vf->sar_height = 33;
+			vf->sar_width = 80;
+			break;
+		case 10:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 18;
+			break;
+		case 11:
+			ar = 0x3ff;
+			vf->sar_height = 11;
+			vf->sar_width = 15;
+			break;
+		case 12:
+			ar = 0x3ff;
+			vf->sar_height = 33;
+			vf->sar_width = 64;
+			break;
+		case 13:
+			ar = 0x3ff;
+			vf->sar_height = 99;
+			vf->sar_width = 160;
+			break;
+		case 14:
+			ar = 0x3ff;
+			vf->sar_height = 3;
+			vf->sar_width = 4;
+			break;
+		case 15:
+			ar = 0x3ff;
+			vf->sar_height = 2;
+			vf->sar_width = 3;
+			break;
+		case 16:
+			ar = 0x3ff;
+			vf->sar_height = 1;
+			vf->sar_width = 2;
+			break;
+		default:
+			ar = 0x3ff;
+			vf->sar_height = 1;
+			vf->sar_width = 1;
+			break;
+		}
 	}
+	ar =  min_t(u32, ar, DISP_RATIO_ASPECT_RATIO_MAX);
+
+	vf->ratio_control = (ar << DISP_RATIO_ASPECT_RATIO_BIT);
 }
 
 static int vh264mvc_vf_states(struct vframe_states *states, void *op_arg)
@@ -888,6 +978,14 @@ static void do_alloc_work(struct work_struct *work)
 
 }
 
+static void mvc_set_rp(void) {
+	unsigned long flags;
+
+	spin_lock_irqsave(&mvc_rp_lock, flags);
+	STBUF_WRITE(&vdec->vbuf, set_rp,
+		READ_VREG(VLD_MEM_VIFIFO_RP));
+	spin_unlock_irqrestore(&mvc_rp_lock, flags);
+}
 
 #ifdef HANDLE_h264mvc_IRQ
 static irqreturn_t vh264mvc_isr(int irq, void *dev_id)
@@ -902,10 +1000,8 @@ static void vh264mvc_isr(void)
 	u32 frame_size;
 	int ret = READ_VREG(MAILBOX_COMMAND);
 
-	if (is_support_no_parser()) {
-		STBUF_WRITE(&vdec->vbuf, set_rp,
-			READ_VREG(VLD_MEM_VIFIFO_RP));
-	}
+	mvc_set_rp();
+
 	/* pr_info("vh264mvc_isr, cmd =%x\n", ret); */
 	switch (ret & 0xff) {
 	case CMD_ALLOC_VIEW_0:
@@ -1097,6 +1193,8 @@ static void vh264mvc_put_timer_func(unsigned long arg)
 	struct timer_list *timer = (struct timer_list *)arg;
 
 	int valid_frame = 0;
+
+	mvc_set_rp();
 
 	if (enable_recycle == 0) {
 		if (dbg_mode & TIME_TASK_PRINT_ENABLE) {
@@ -1645,6 +1743,7 @@ static int amvdec_h264mvc_probe(struct platform_device *pdev)
 
 	INIT_WORK(&error_wd_work, error_do_work);
 	INIT_WORK(&set_clk_work, vh264_mvc_set_clk);
+	spin_lock_init(&mvc_rp_lock);
 
 	vdec = pdata;
 

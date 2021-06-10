@@ -308,6 +308,8 @@ void vdec_input_init(struct vdec_input_s *input, struct vdec_s *vdec)
 	input->block_id_seq = 0;
 	input->size = 0;
 	input->default_block_size = VFRAME_BLOCK_SIZE;
+	snprintf(input->vdec_input_name, sizeof(input->vdec_input_name),
+		 "vdec-input-%d", vdec->id);
 }
 int vdec_input_prepare_bufs(struct vdec_input_s *input,
 	int frame_width, int frame_height)
@@ -958,7 +960,7 @@ int vdec_input_add_chunk(struct vdec_input_s *input, const char *buf,
 
 	if (input->have_frame_num == 1)
 		input->vdec_up(vdec);
-	ATRACE_COUNTER(MEM_NAME, input->have_frame_num);
+	ATRACE_COUNTER(input->vdec_input_name, input->have_frame_num);
 	if (chunk->pts_valid) {
 		input->last_inpts_u64 = chunk->pts64;
 		input->last_in_nopts_cnt = 0;
@@ -1084,7 +1086,7 @@ void vdec_input_release_chunk(struct vdec_input_s *input,
 
 	list_del(&chunk->list);
 	input->have_frame_num--;
-	ATRACE_COUNTER(MEM_NAME, input->have_frame_num);
+	ATRACE_COUNTER(input->vdec_input_name, input->have_frame_num);
 	if (chunk->pts_valid) {
 		input->last_comsumed_no_pts_cnt = 0;
 		input->last_comsumed_pts_u64 = chunk->pts64;
@@ -1183,6 +1185,9 @@ u32 vdec_input_get_freed_handle(struct vdec_s *vdec)
 	struct vdec_input_s *input = &vdec->input;
 	unsigned long flags;
 	u32 handle = 0;
+
+	if (!vdec)
+		return 0;
 
 	if (!vdec_secure(vdec))
 		return 0;

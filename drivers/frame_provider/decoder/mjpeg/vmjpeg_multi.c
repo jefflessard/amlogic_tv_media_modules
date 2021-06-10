@@ -51,7 +51,6 @@
 #define MEM_NAME "codec_mmjpeg"
 
 #define DRIVER_NAME "ammvdec_mjpeg"
-#define MODULE_NAME "ammvdec_mjpeg"
 #define CHECK_INTERVAL        (HZ/100)
 
 /* protocol register usage
@@ -230,6 +229,10 @@ struct vdec_mjpeg_hw_s {
 	u32 res_ch_flag;
 	u32 canvas_mode;
 	u32 canvas_endian;
+	char vdec_name[32];
+	char pts_name[32];
+	char new_q_name[32];
+	char disp_q_name[32];
 };
 
 static void reset_process_time(struct vdec_mjpeg_hw_s *hw);
@@ -249,7 +252,9 @@ static void set_frame_info(struct vdec_mjpeg_hw_s *hw, struct vframe_s *vf)
 	else if (temp > 0)
 		vf->height = hw->frame_height = temp;
 	vf->duration = hw->frame_dur;
-	vf->ratio_control = 0;
+	vf->ratio_control = DISP_RATIO_ASPECT_RATIO_MAX << DISP_RATIO_ASPECT_RATIO_BIT;
+	vf->sar_width = 1;
+	vf->sar_height = 1;
 	vf->duration_pulldown = 0;
 	vf->flag = 0;
 
@@ -440,7 +445,9 @@ static irqreturn_t vmjpeg_isr_thread_fn(struct vdec_s *vdec, int irq)
 	decoder_do_frame_check(vdec, vf);
 	vdec_vframe_ready(vdec, vf);
 	kfifo_put(&hw->display_q, (const struct vframe_s *)vf);
-	ATRACE_COUNTER(MODULE_NAME, vf->pts);
+	ATRACE_COUNTER(hw->pts_name, vf->pts);
+	ATRACE_COUNTER(hw->new_q_name, kfifo_len(&hw->newframe_q));
+	ATRACE_COUNTER(hw->disp_q_name, kfifo_len(&hw->display_q));
 	hw->frame_num++;
 	mmjpeg_debug_print(DECODE_ID(hw), PRINT_FRAME_NUM,
 		"%s:frame num:%d,pts=%d,pts64=%lld. dur=%d\n",
@@ -459,6 +466,21 @@ static irqreturn_t vmjpeg_isr_thread_fn(struct vdec_s *vdec, int irq)
 	vdec_schedule_work(&hw->work);
 
 	return IRQ_HANDLED;
+}
+
+static int valid_vf_check(struct vframe_s *vf, struct vdec_mjpeg_hw_s *hw)
+{
+	int i;
+
+	if (!vf || (vf->index == -1))
+		return 0;
+
+	for (i = 0; i < VF_POOL_SIZE; i++) {
+		if (vf == &hw->vfpool[i])
+			return 1;
+	}
+
+	return 0;
 }
 
 static struct vframe_s *vmjpeg_vf_peek(void *op_arg)
@@ -485,9 +507,10 @@ static struct vframe_s *vmjpeg_vf_get(void *op_arg)
 	if (!hw)
 		return NULL;
 	hw->get_num++;
-	if (kfifo_get(&hw->display_q, &vf))
+	if (kfifo_get(&hw->display_q, &vf)) {
+		ATRACE_COUNTER(hw->disp_q_name, kfifo_len(&hw->display_q));
 		return vf;
-
+	}
 	return NULL;
 }
 
@@ -496,13 +519,17 @@ static void vmjpeg_vf_put(struct vframe_s *vf, void *op_arg)
 	struct vdec_s *vdec = op_arg;
 	struct vdec_mjpeg_hw_s *hw = (struct vdec_mjpeg_hw_s *)vdec->private;
 
-	if (!vf)
-		return;
+	if (!valid_vf_check(vf, hw)) {
+		mmjpeg_debug_print(DECODE_ID(hw), PRINT_FLAG_ERROR,
+			"invalid vf: %lx\n", (ulong)vf);
+		return ;
+	}
 
 	mmjpeg_debug_print(DECODE_ID(hw), PRINT_FRAME_NUM,
 		"%s:put_num:%d\n", __func__, hw->put_num);
 	hw->vfbuf_use[vf->index]--;
 	kfifo_put(&hw->newframe_q, (const struct vframe_s *)vf);
+	ATRACE_COUNTER(hw->new_q_name, kfifo_len(&hw->newframe_q));
 	hw->put_num++;
 }
 
@@ -1618,6 +1645,15 @@ static int ammvdec_mjpeg_probe(struct platform_device *pdev)
 	pdata->irq_handler = vmjpeg_isr;
 	pdata->threaded_irq_handler = vmjpeg_isr_thread_fn;
 	pdata->dump_state = vmjpeg_dump_state;
+
+	snprintf(hw->vdec_name, sizeof(hw->vdec_name),
+		"vmjpeg-%d", pdev->id);
+	snprintf(hw->pts_name, sizeof(hw->pts_name),
+		"%s-pts", hw->vdec_name);
+	snprintf(hw->new_q_name, sizeof(hw->new_q_name),
+		"%s-newframe_q", hw->vdec_name);
+	snprintf(hw->disp_q_name, sizeof(hw->disp_q_name),
+		"%s-dispframe_q", hw->vdec_name);
 
 	if (pdata->parallel_dec == 1) {
 		int i;

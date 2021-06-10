@@ -80,6 +80,9 @@ extern void vdec_poweron(enum vdec_type_e core);
 extern void vdec_poweroff(enum vdec_type_e core);
 extern bool vdec_on(enum vdec_type_e core);
 extern void vdec_power_reset(void);
+extern void vdec_set_dmc_urgent(struct vdec_s *vdec, int urgentType);
+
+
 
 /*irq num as same as .dts*/
 
@@ -314,6 +317,11 @@ struct vdec_s {
 	u32 jump_back_error;
 	u32 jump_back_rp;
 #endif
+	u32 video_id;
+	char name[32];
+	char dec_spend_time[32];
+	char dec_spend_time_ave[32];
+	u32 discard_start_data_flag;
 };
 
 /* common decoder vframe provider name to use default vfm path */
@@ -484,7 +492,9 @@ int vdec_wakeup_userdata_poll(struct vdec_s *vdec);
 
 void vdec_reset_userdata_fifo(struct vdec_s *vdec, int bInit);
 
+struct vdec_s *vdec_get_vdec_by_video_id(int video_id);
 struct vdec_s *vdec_get_vdec_by_id(int vdec_id);
+
 
 #ifdef VDEC_FCC_SUPPORT
 int vdec_wakeup_fcc_poll(struct vdec_s *vdec);
